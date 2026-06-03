@@ -1,48 +1,60 @@
+using System.Text;
+using CustomerAccountAPI.Application.Common;
+using CustomerAccountAPI.Domain.Entities;
+using CustomerAccountAPI.Domain.Interfaces;
+using CustomerAccountAPI.Infrastructure.Data;
+using CustomerAccountAPI.Infrastructure.Repositories;
+using CustomerAccountAPI.Infrastructure.Services;
+using CustomerAccountAPI.Web.Middleware;
+using FluentValidation;
+using MediatR;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
-using System.Text;
-using CustomerAccountAPI.Data;
-using CustomerAccountAPI.Models;
 
 var builder = WebApplication.CreateBuilder(args);
+var config = builder.Configuration;
 
-// Add MySQL Database Context
-builder.Services.AddDbContext<ApplicationDbContext>(options =>
-    options.UseMySql(
-        builder.Configuration.GetConnectionString("DefaultConnection"),
-        ServerVersion.AutoDetect(builder.Configuration.GetConnectionString("DefaultConnection"))
-    ));
+// ─── Infrastructure ───
+builder.Services.AddDbContext<AppDbContext>(opt =>
+    opt.UseSqlServer(config.GetConnectionString("DefaultConnection")));
 
-// Configure Identity
 builder.Services.AddIdentity<Customer, IdentityRole>()
-    .AddEntityFrameworkStores<ApplicationDbContext>()
+    .AddEntityFrameworkStores<AppDbContext>()
     .AddDefaultTokenProviders();
 
-// Configure JWT Authentication
-var jwtSettings = builder.Configuration.GetSection("JwtSettings");
-var secretKey = jwtSettings["Secret"] ?? throw new InvalidOperationException("JWT Secret key not configured");
-var key = Encoding.ASCII.GetBytes(secretKey);
+builder.Services.AddScoped<IAccountRepository, AccountRepository>();
+builder.Services.AddScoped<ITokenService, JwtTokenService>();
 
-builder.Services.AddAuthentication(options =>
+// ─── Application ───
+builder.Services.AddMediatR(cfg => cfg.RegisterServicesFromAssemblyContaining<Program>());
+builder.Services.AddValidatorsFromAssemblyContaining<Program>();
+builder.Services.AddTransient(typeof(IPipelineBehavior<,>), typeof(ValidationBehavior<,>));
+
+// ─── Authentication ───
+var jwtSection = config.GetSection("JwtSettings");
+var key = Encoding.ASCII.GetBytes(jwtSection["Secret"]
+    ?? throw new InvalidOperationException("JWT Secret not configured."));
+
+builder.Services.AddAuthentication(opt =>
 {
-    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    opt.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    opt.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
 })
-.AddJwtBearer(options =>
+.AddJwtBearer(opt =>
 {
-    options.RequireHttpsMetadata = false;
-    options.SaveToken = true;
-    options.TokenValidationParameters = new TokenValidationParameters
+    opt.RequireHttpsMetadata = false;
+    opt.SaveToken = true;
+    opt.TokenValidationParameters = new TokenValidationParameters
     {
         ValidateIssuerSigningKey = true,
         IssuerSigningKey = new SymmetricSecurityKey(key),
         ValidateIssuer = true,
-        ValidIssuer = jwtSettings["Issuer"],
+        ValidIssuer = jwtSection["Issuer"],
         ValidateAudience = true,
-        ValidAudience = jwtSettings["Audience"],
+        ValidAudience = jwtSection["Audience"],
         ValidateLifetime = true,
         ClockSkew = TimeSpan.Zero
     };
@@ -50,20 +62,18 @@ builder.Services.AddAuthentication(options =>
 
 builder.Services.AddAuthorization();
 
+// ─── API ───
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-
-// FIXED: Configure Swagger with JWT support
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new OpenApiInfo
     {
         Title = "Customer Account API",
         Version = "v1",
-        Description = "API for managing customer accounts with JWT authentication"
+        Description = "Clean Architecture + CQRS banking API"
     });
 
-    // Add JWT Authentication support to Swagger
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -71,7 +81,7 @@ builder.Services.AddSwaggerGen(c =>
         Scheme = "bearer",
         BearerFormat = "JWT",
         In = ParameterLocation.Header,
-        Description = "Enter your JWT token in the text input below.\n\nExample: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        Description = "Enter your JWT token"
     });
 
     c.AddSecurityRequirement(new OpenApiSecurityRequirement
@@ -79,65 +89,75 @@ builder.Services.AddSwaggerGen(c =>
         {
             new OpenApiSecurityScheme
             {
-                Reference = new OpenApiReference
-                {
-                    Type = ReferenceType.SecurityScheme,
-                    Id = "Bearer"
-                }
+                Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" }
             },
-            new string[] {}
+            Array.Empty<string>()
         }
     });
 });
 
+// ─── Build & Configure Pipeline ───
 var app = builder.Build();
 
-// Configure pipeline
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
-    app.UseSwaggerUI(c =>
-    {
-        c.SwaggerEndpoint("/swagger/v1/swagger.json", "Customer Account API V1");
-        c.DocumentTitle = "Customer Account API Documentation";
-    });
+    app.UseSwaggerUI();
 }
 
+app.UseMiddleware<ExceptionHandler>();
 app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
 
-// Create database and roles on startup
-using (var scope = app.Services.CreateScope())
+// ─── Seed Database ───
+await SeedAsync(app);
+app.Run();
+
+static async Task SeedAsync(WebApplication app)
 {
+    using var scope = app.Services.CreateScope();
     var services = scope.ServiceProvider;
+
     try
     {
-        var context = services.GetRequiredService<ApplicationDbContext>();
-        await context.Database.MigrateAsync();
+        var db = services.GetRequiredService<AppDbContext>();
+        await db.Database.MigrateAsync();
 
         var roleManager = services.GetRequiredService<RoleManager<IdentityRole>>();
-        await CreateRoles(roleManager);
+        foreach (var role in new[] { "Admin", "Customer", "Manager" })
+        {
+            if (!await roleManager.RoleExistsAsync(role))
+                await roleManager.CreateAsync(new IdentityRole(role));
+        }
+
+        var userManager = services.GetRequiredService<UserManager<Customer>>();
+        var config = services.GetRequiredService<IConfiguration>();
+        var adminEmail = config["AdminSettings:Email"] ?? "admin@customeraccount.com";
+        var adminPass = config["AdminSettings:Password"] ?? "Admin@123456";
+
+        if (await userManager.FindByEmailAsync(adminEmail) is null)
+        {
+            var admin = new Customer
+            {
+                UserName = adminEmail,
+                Email = adminEmail,
+                FirstName = "System",
+                LastName = "Admin",
+                DateOfBirth = new DateTime(1990, 1, 1),
+                CreatedAt = DateTime.UtcNow,
+                EmailConfirmed = true
+            };
+
+            var result = await userManager.CreateAsync(admin, adminPass);
+            if (result.Succeeded)
+                await userManager.AddToRoleAsync(admin, "Admin");
+        }
     }
     catch (Exception ex)
     {
         var logger = services.GetRequiredService<ILogger<Program>>();
-        logger.LogError(ex, "An error occurred while creating the database or roles.");
+        logger.LogError(ex, "Error seeding database");
     }
 }
-
-async Task CreateRoles(RoleManager<IdentityRole> roleManager)
-{
-    string[] roleNames = { "Admin", "Customer", "Manager" };
-    foreach (var roleName in roleNames)
-    {
-        var roleExist = await roleManager.RoleExistsAsync(roleName);
-        if (!roleExist)
-        {
-            await roleManager.CreateAsync(new IdentityRole(roleName));
-        }
-    }
-}
-
-app.Run();
